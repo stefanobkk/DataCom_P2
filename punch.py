@@ -1,0 +1,217 @@
+import asyncore
+import socket
+import logging
+from cStringIO import StringIO
+from urlparse import urlparse
+import time
+import sys
+
+
+def make_request(req_type, what, details, ver="1.1"):
+    """ Compose an HTTP request """
+    NL = "\r\n"
+    req_line = "{verb} {w} HTTP/{v}".format(
+        verb=req_type, w=what, v=ver
+    )
+    details = [
+        "{name}: {v}".format(name=n, v=v) for (n, v) in details.iteritems()
+    ]
+    detail_lines = NL.join(details)
+    full_request = "".join([req_line, NL, detail_lines, NL, NL])
+    return full_request
+
+
+def get_header_dict(header):
+
+    data = header.replace("\n ", " ").splitlines()
+    headers = {}
+    for line in data:
+        split_here = line.find(":")
+        headers[line[:split_here]] = line[split_here:]
+
+    return headers
+
+
+def parse_url(url, DEFAULT_PORT=80):
+    """ Parse a given url into host, path, and port.
+       Use DEFAULT_PORT (80) if unspecified.
+   """
+    parsed_url = urlparse(url)
+    host, path, port = (parsed_url.hostname,
+                        parsed_url.path,
+                        parsed_url.port)
+    if not port:
+        port = DEFAULT_PORT
+    return (host, path, port)
+
+
+class HTTPClient(asyncore.dispatcher):
+    # Size of the buffer for each recv
+    RECV_CHUNK_SIZE = 4096
+
+    def __init__(self, url, r):
+        asyncore.dispatcher.__init__(self)
+        self.host, self.path, self.port = parse_url(url)
+        self.r = r
+        self.ori = r
+        # Create a logger
+        #self.logger = logging.getLogger(url)
+        self.start_time = 0
+        self.end_time = 0
+        # Create a TCP socket to host at the right port
+        # print self.host,self.port
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.connect((self.host, self.port))
+
+        self.counter = 0
+        self.must_recv = 0
+        self.success, self.fail = 0, 0
+        # Create recv buffer and send buffer
+        (self.recvbuf, self.sendbuf) = (StringIO(), "")
+
+        # Make an initial request & deliver it
+        if self.r == 1:
+            self.request = make_request('GET', self.path,
+                                        {'Host': self.host,
+                                         'Connection': 'close',
+                                         'P2Tag': 'u5580025_u5480954'}
+                                        )
+        elif self.r <= 0:
+            print"cant send, no of rq is 0"
+        else:
+            self.request = make_request('GET', self.path,
+                                        {'Host': self.host,
+                                         'Connection': 'keep-alive',
+                                         'P2Tag': 'u5580025_u5480954'}
+                                        )
+        self.start_time = time.time()
+        self.write(self.request)
+        self.r -= 1
+
+    def write(self, data):
+        """ Schedule to deliver data over the socket """
+        self.sendbuf += data
+
+    def handle_connect(self):
+        #self.logger.debug("Connected")
+        #print self.r
+        pass
+
+    def handle_close(self):
+        #self.logger.debug("Disconnected")
+        self.close()
+        if self.r != 0:
+            # print "trying to connect"
+            self.counter = 0
+            self.must_recv = 0
+            self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.connect((self.host, self.port))
+
+    def writeable(self):
+        """ Check if there is anything to send """
+        return len(self.sendbuf) > 0
+
+    def handle_write(self):
+
+        bytes_sent = self.send(self.sendbuf)
+        self.sendbuf = self.sendbuf[bytes_sent:]
+
+    def handle_read(self):
+        global lst_all_req_time
+        global complete
+        global not_complete
+        recv_bytes = self.recv(HTTPClient.RECV_CHUNK_SIZE)
+
+
+        self.counter += len(recv_bytes)
+        if 'Content-Length' in recv_bytes:
+            header, data = recv_bytes.split("\r\n\r\n")
+            head_dict = get_header_dict(header)
+            content_len = int(head_dict['Content-Length'][2:])
+            header_len = len(header) + 4
+            self.must_recv = (header_len + content_len)
+            if 'HTTP/1.1 200 O' in head_dict:
+                self.success += 1
+            else:
+                self.fail += 1
+        else:
+            pass
+            # print "\r\n\r\n not found"
+
+        # print content_len
+        #self.logger.debug("recvd {} bytes".format(len(recv_bytes)))
+
+        self.recvbuf.write(recv_bytes)
+
+        if self.counter == self.must_recv and self.r > 1:
+            self.end_time = time.time() - self.start_time
+            lst_all_req_time.append(self.end_time)
+            self.r -= 1
+            self.counter = 0
+            self.must_recv = 0
+            # print self.request
+            self.start_time = time.time()
+            self.write(self.request)
+        elif self.counter == self.must_recv and self.r == 1:
+            # self.end_time = time.time() - self.start_time
+            # lst_all_req_time.append(self.end_time)
+
+            self.r -= 1
+            self.request = make_request('GET', self.path,
+                                        {'Host': self.host,
+                                         'Connection': 'close',
+                                         'P2Tag': 'u5580025_u5480954'}
+                                        )
+            self.counter = 0
+            self.must_recv = 0
+            # print self.request
+            self.start_time = time.time()
+            self.write(self.request)
+        elif self.counter == self.must_recv and self.r == 0:
+            self.end_time = time.time() - self.start_time
+            lst_all_req_time.append(self.end_time)
+            #self.end_time = time.time() - self.start_time
+            #lst_all_req_time.append(self.end_time)
+            # print "success: ",self.success
+            # print "fail: ",self.fail
+            # print"gonna close socket"
+            pass
+            # self.close()
+
+
+if __name__ == "__main__":
+    url = sys.argv[5]
+    logging.basicConfig(level=logging.DEBUG,
+                        format="%(asctime)-15s %(name)s: %(message)s"
+                        )
+    maxcon = int(sys.argv[4])
+    maxrq = int(sys.argv[2])
+    percon = maxrq // maxcon
+    lst_all_req_time = []
+    complete = 0
+    complete2 = maxrq
+    not_complete = 0
+    to_do = [HTTPClient(url, percon) for x in range(maxcon)]
+    # print "[HTTPCLIENT({a},{b}) for x in
+    # range({c})]".format(a=url,b=percon,c=maxcon)
+    start_ = time.time()
+    asyncore.loop()
+    end_ = time.time() - start_
+
+
+
+    # print total
+    # print maxcon, maxrq, percon
+    #
+    print "Time taken for tests: %s seconds" %(end_)
+    print "Complete requests: %s" %(complete2)
+    print "Failed requests: %s" %(not_complete)
+    print "Avg requests per second: %s [req/s]" % ((complete2)/(end_))
+    print ""
+    print "Percentage of the requests served within a certain time (ms)"
+    print "  50%    ",(int((lst_all_req_time[int(len(lst_all_req_time)/2)])*(10**3)))
+    print "  60%    ",(int((lst_all_req_time[int(len(lst_all_req_time)/1.66666)])*(10**3)))
+    print "  70%    ",(int((lst_all_req_time[int(len(lst_all_req_time)/1.42857)])*(10**3)))
+    print "  80%    ",(int((lst_all_req_time[int(len(lst_all_req_time)/1.25)])*(10**3)))
+    print "  90%    ",(int((lst_all_req_time[int(len(lst_all_req_time)/1.11111)])*(10**3)))
+    print " 100%    ",(int((lst_all_req_time[int(len(lst_all_req_time)-1)])*(10**3)))
